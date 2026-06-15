@@ -4,12 +4,22 @@ import { dataUrlToFile } from "@/lib/image-utils";
 import { getMediaBlob, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
 import { boolConfig, buildSeedancePromptText, isSeedanceVideoConfig, normalizeSeedanceDuration, normalizeSeedanceRatio, normalizeSeedanceResolution, seedanceVideoReferenceError, SEEDANCE_REFERENCE_LIMITS } from "@/lib/seedance-video";
-import { buildApiUrl, type AiConfig } from "@/stores/use-config-store";
+import { buildCapabilityApiUrl, buildCapabilityHeaders, getCapabilityApiKey, getCapabilityBaseUrl, type AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
-type VideoResponse = { id: string; status?: string; error?: { message?: string } };
+type VideoResponse = {
+    id: string;
+    status?: string;
+    error?: { message?: string };
+    url?: string;
+    video_url?: string;
+    result_url?: string;
+    content?: { video_url?: string; url?: string };
+    output?: { video_url?: string; url?: string };
+    data?: { video_url?: string; url?: string };
+};
 type ApiVideoResponse = VideoResponse | { code?: number; data?: VideoResponse | null; msg?: string };
 type SeedanceTask = {
     id: string;
@@ -25,20 +35,12 @@ export type VideoGenerationTask = { id: string; provider: "openai" | "seedance";
 export type VideoGenerationTaskState = { status: "pending" } | { status: "completed"; result: VideoGenerationResult } | { status: "failed"; error: string };
 
 function aiApiUrl(config: AiConfig, path: string) {
-    return config.channelMode === "remote" ? `/api/v1${path}` : buildApiUrl(config.baseUrl, path);
+    return buildCapabilityApiUrl(config, "video", path);
 }
 
 function aiHeaders(config: AiConfig, contentType?: string) {
     const token = useUserStore.getState().token;
-    return config.channelMode === "remote"
-        ? {
-              ...(token ? { Authorization: `Bearer ${token}` } : {}),
-              ...(contentType ? { "Content-Type": contentType } : {}),
-          }
-        : {
-              Authorization: `Bearer ${config.apiKey}`,
-              ...(contentType ? { "Content-Type": contentType } : {}),
-          };
+    return buildCapabilityHeaders(config, "video", token, contentType);
 }
 
 function refreshRemoteUser(config: AiConfig) {
@@ -61,7 +63,7 @@ export async function requestVideoGeneration(config: AiConfig, prompt: string, r
 export async function createVideoGenerationTask(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = []): Promise<VideoGenerationTask> {
     const model = (config.model || config.videoModel).trim();
     assertVideoConfig(config, model);
-    if (isSeedanceVideoConfig({ ...config, model })) {
+    if (isSeedanceVideoConfig({ channelMode: config.channelMode, ...config, model })) {
         return createSeedanceTask(config, model, prompt, references, videoReferences, audioReferences);
     }
     if (videoReferences.length || audioReferences.length) {
@@ -82,6 +84,25 @@ export async function storeGeneratedVideo(result: VideoGenerationResult): Promis
 }
 
 async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[]): Promise<VideoGenerationTask> {
+    if (config.channelMode === "local") {
+        if (references.length) throw new Error("当前本地视频接口暂不支持参考图片，请先移除参考图后重试");
+        const payload = {
+            model,
+            prompt,
+            seconds: normalizeVideoSeconds(config.videoSeconds),
+            resolution_name: normalizeVideoResolution(config.vquality),
+            preset: "normal",
+            ...(normalizeVideoSize(config.size) ? { size: normalizeVideoSize(config.size)! } : {}),
+        };
+        try {
+            const created = unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos"), payload, { headers: aiHeaders(config, "application/json") })).data);
+            if (!created.id) throw new Error("视频接口没有返回任务 ID");
+            return { id: created.id, provider: "openai", model };
+        } catch (error) {
+            throw new Error(readAxiosError(error, "视频任务创建失败"));
+        }
+    }
+
     const body = new FormData();
     body.append("model", model);
     body.append("prompt", prompt);
@@ -103,13 +124,17 @@ async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: st
 async function pollOpenAIVideoTask(config: AiConfig, task: VideoGenerationTask): Promise<VideoGenerationTaskState> {
     try {
         const video = unwrapVideoResponse((await axios.get<ApiVideoResponse>(aiApiUrl(config, `/videos/${task.id}`), { headers: aiHeaders(config), params: config.channelMode === "remote" ? { model: task.model } : undefined })).data);
-        if (video.status === "completed") {
+        const normalizedStatus = normalizeOpenAIVideoStatus(video.status);
+        const directUrl = readOpenAIVideoUrl(video);
+        if (normalizedStatus === "completed") {
+            if (directUrl) return { status: "completed", result: await videoResultFromUrl(directUrl) };
             const content = await axios.get<Blob>(aiApiUrl(config, `/videos/${task.id}/content`), { headers: aiHeaders(config), params: config.channelMode === "remote" ? { model: task.model } : undefined, responseType: "blob" });
             await assertVideoBlob(content.data);
             refreshRemoteUser(config);
             return { status: "completed", result: { blob: content.data } };
         }
-        if (video.status === "failed" || video.status === "cancelled") return { status: "failed", error: video.error?.message || "视频生成失败" };
+        if (normalizedStatus === "failed") return { status: "failed", error: video.error?.message || "视频生成失败" };
+        if (directUrl && normalizedStatus === "pending") return { status: "completed", result: await videoResultFromUrl(directUrl) };
         return { status: "pending" };
     } catch (error) {
         throw new Error(readAxiosError(error, "视频任务查询失败"));
@@ -159,6 +184,17 @@ async function pollSeedanceTask(config: AiConfig, task: VideoGenerationTask): Pr
     }
 }
 
+function normalizeOpenAIVideoStatus(status: string | undefined) {
+    const value = String(status || "").trim().toLowerCase();
+    if (["completed", "succeeded", "success", "done", "finished", "ready"].includes(value)) return "completed";
+    if (["failed", "cancelled", "canceled", "error", "expired", "rejected"].includes(value)) return "failed";
+    return "pending";
+}
+
+function readOpenAIVideoUrl(video: VideoResponse) {
+    return video.url || video.video_url || video.result_url || video.content?.video_url || video.content?.url || video.output?.video_url || video.output?.url || video.data?.video_url || video.data?.url || "";
+}
+
 function assertSeedanceVideoReferences(videoReferences: ReferenceVideo[]) {
     const error = seedanceVideoReferenceError(videoReferences);
     if (error) throw new Error(error);
@@ -183,7 +219,11 @@ function assertSeedanceAudioReferences(audioReferences: ReferenceAudio[]) {
 
 function seedanceApiUrl(config: AiConfig, taskId?: string) {
     if (config.channelMode === "remote") return taskId ? `/api/v1/videos/${encodeURIComponent(taskId)}` : "/api/v1/videos";
-    return buildApiUrl(config.baseUrl, `/contents/generations/tasks${taskId ? `/${encodeURIComponent(taskId)}` : ""}`);
+    return buildSeedanceLocalUrl(getCapabilityBaseUrl(config, "video"), `/contents/generations/tasks${taskId ? `/${encodeURIComponent(taskId)}` : ""}`);
+}
+
+function buildSeedanceLocalUrl(baseUrl: string, path: string) {
+    return `${baseUrl.trim().replace(/\/+$/, "")}${path}`;
 }
 
 async function buildSeedanceContent(config: AiConfig, prompt: string, references: ReferenceImage[], videoReferences: ReferenceVideo[], audioReferences: ReferenceAudio[]) {
@@ -256,8 +296,8 @@ async function videoResultFromUrl(url: string): Promise<VideoGenerationResult> {
 
 function assertVideoConfig(config: AiConfig, model: string) {
     if (!model) throw new Error("请先配置视频模型");
-    if (config.channelMode === "local" && !config.baseUrl.trim()) throw new Error("请先配置 Base URL");
-    if (config.channelMode === "local" && !config.apiKey.trim()) throw new Error("请先配置 API Key");
+    if (config.channelMode === "local" && !getCapabilityBaseUrl(config, "video").trim()) throw new Error("请先配置视频 Base URL");
+    if (config.channelMode === "local" && !getCapabilityApiKey(config, "video").trim()) throw new Error("请先配置视频 API Key");
 }
 
 function normalizeVideoSeconds(value: string) {
@@ -298,9 +338,9 @@ function unwrapEnvelope<T>(payload: ApiEnvelope<T>, emptyMessage: string): T {
 }
 
 function readAxiosError(error: unknown, fallback: string) {
-    if (axios.isAxiosError<{ error?: { message?: string }; msg?: string; code?: number }>(error)) {
+    if (axios.isAxiosError<{ error?: { message?: string }; msg?: string; message?: string; code?: number }>(error)) {
         const responseData = error.response?.data;
-        return responseData?.msg || responseData?.error?.message || statusMessage(error.response?.status, fallback);
+        return responseData?.msg || responseData?.message || responseData?.error?.message || statusMessage(error.response?.status, fallback);
     }
     return error instanceof Error ? error.message : fallback;
 }

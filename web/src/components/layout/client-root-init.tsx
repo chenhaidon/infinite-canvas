@@ -8,6 +8,8 @@ import { App } from "antd";
 import { useConfigStore } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 
+const localChannelCapabilities = ["image", "video", "text", "audio"] as const;
+
 export function ClientRootInit({ children }: { children: ReactNode }) {
     const { message } = App.useApp();
     const handledConfigParams = useRef(false);
@@ -16,6 +18,7 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
     const loadPublicSettings = useConfigStore((state) => state.loadPublicSettings);
     const publicSettings = useConfigStore((state) => state.publicSettings);
     const updateConfig = useConfigStore((state) => state.updateConfig);
+    const updateLocalChannelConfig = useConfigStore((state) => state.updateLocalChannelConfig);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
     const isLoginPage = pathname === "/login" || pathname === "/admin/login";
 
@@ -46,10 +49,16 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
             return;
         }
         updateConfig("channelMode", "local");
-        if (baseUrl) updateConfig("baseUrl", baseUrl);
-        if (apiKey) updateConfig("apiKey", apiKey);
+        if (baseUrl) {
+            updateConfig("baseUrl", baseUrl);
+            for (const capability of localChannelCapabilities) updateLocalChannelConfig(capability, "baseUrl", baseUrl);
+        }
+        if (apiKey) {
+            updateConfig("apiKey", apiKey);
+            for (const capability of localChannelCapabilities) updateLocalChannelConfig(capability, "apiKey", apiKey);
+        }
         openConfigDialog(false);
-    }, [message, openConfigDialog, publicSettings, updateConfig]);
+    }, [message, openConfigDialog, publicSettings, updateConfig, updateLocalChannelConfig]);
 
     return <>{children}</>;
 }

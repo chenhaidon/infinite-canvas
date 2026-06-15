@@ -195,7 +195,7 @@ export default function VideoPage() {
             message.error("请输入视频提示词");
             return null;
         }
-        if (!isAiConfigReady(effectiveConfig, model)) {
+        if (!isAiConfigReady(effectiveConfig, model, "video")) {
             message.warning("请先完成配置");
             openConfigDialog(true);
             return null;
@@ -821,7 +821,7 @@ function buildLog({ prompt, model, config, references, videoReferences, audioRef
 }
 
 function buildVideoConfig(config: AiConfig, model: string): AiConfig {
-    const seedance = isSeedanceVideoConfig({ ...config, model });
+    const seedance = isSeedanceVideoConfig({ channelMode: config.channelMode, ...config, model });
     return {
         ...config,
         model,

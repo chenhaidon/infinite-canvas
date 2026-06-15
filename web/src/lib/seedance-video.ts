@@ -1,4 +1,4 @@
-import type { AiConfig } from "@/stores/use-config-store";
+import { getCapabilityBaseUrl, type AiConfig } from "@/stores/use-config-store";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
@@ -56,8 +56,10 @@ const seedancePixels = {
     },
 } as const;
 
-export function isSeedanceVideoConfig(config: Pick<AiConfig, "model" | "videoModel" | "baseUrl">) {
-    return isSeedanceVideoModel(config.model || config.videoModel) || isArkPlanBaseUrl(config.baseUrl);
+export function isSeedanceVideoConfig(config: Pick<AiConfig, "channelMode" | "model" | "videoModel" | "baseUrl" | "localChannels">) {
+    const videoBaseUrl = config.channelMode === "local" ? getCapabilityBaseUrl(config as AiConfig, "video") : config.baseUrl;
+    if (config.channelMode === "local") return isArkPlanBaseUrl(videoBaseUrl);
+    return isSeedanceVideoModel(config.model || config.videoModel) || isArkPlanBaseUrl(videoBaseUrl);
 }
 
 export function isSeedanceVideoModel(model: string) {

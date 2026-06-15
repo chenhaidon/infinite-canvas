@@ -1,6 +1,6 @@
 import axios from "axios";
 
-import { buildApiUrl, type AiConfig } from "@/stores/use-config-store";
+import { buildCapabilityApiUrl, buildCapabilityHeaders, getCapabilityApiKey, type AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
 import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
@@ -18,6 +18,7 @@ type ImageApiResponse = {
     error?: { message?: string };
     code?: number;
     msg?: string;
+    message?: string;
 };
 
 const QUALITY_BASE: Record<string, number> = {
@@ -35,6 +36,7 @@ const QUALITY_ALIASES: Record<string, string> = {
 const DEFAULT_IMAGE_SHORT_SIDE = 1024;
 const IMAGE_SIZE_STEP = 16;
 const IMAGE_MIN_PIXELS = 655360;
+const IMAGE_MODEL_MIN_PIXELS: Array<{ pattern: RegExp; minPixels: number }> = [{ pattern: /seedream/i, minPixels: 3686400 }];
 const IMAGE_MAX_PIXELS = 8294400;
 const IMAGE_MAX_EDGE = 3840;
 const IMAGE_MAX_RATIO = 3;
@@ -47,7 +49,7 @@ function normalizeQuality(quality: string) {
 }
 
 /** Map "quality + ratio" to an explicit pixel dimension like "3840x2160". */
-function resolveSize(quality: string | undefined, ratio: string): string {
+function resolveSize(quality: string | undefined, ratio: string, minPixels = IMAGE_MIN_PIXELS): string {
     const parsedRatio = parseImageRatio(ratio);
     const basePixels = quality ? QUALITY_BASE[quality] : undefined;
     const isLandscape = parsedRatio.width >= parsedRatio.height;
@@ -56,18 +58,20 @@ function resolveSize(quality: string | undefined, ratio: string): string {
     let shortSide: number;
 
     if (basePixels) {
-        const targetPixels = basePixels * basePixels;
+        const targetPixels = Math.max(basePixels * basePixels, minPixels);
         const longSideRaw = Math.sqrt(targetPixels * longRatio);
         longSide = Math.floor(longSideRaw / IMAGE_SIZE_STEP) * IMAGE_SIZE_STEP;
         shortSide = Math.round(longSide / longRatio / IMAGE_SIZE_STEP) * IMAGE_SIZE_STEP;
     } else {
-        shortSide = DEFAULT_IMAGE_SHORT_SIDE;
+        const targetPixels = Math.max(DEFAULT_IMAGE_SHORT_SIDE * DEFAULT_IMAGE_SHORT_SIDE * longRatio, minPixels);
+        const shortSideRaw = Math.sqrt(targetPixels / longRatio);
+        shortSide = Math.ceil(shortSideRaw / IMAGE_SIZE_STEP) * IMAGE_SIZE_STEP;
         longSide = Math.round((shortSide * longRatio) / IMAGE_SIZE_STEP) * IMAGE_SIZE_STEP;
     }
 
     const width = isLandscape ? longSide : shortSide;
     const height = isLandscape ? shortSide : longSide;
-    validateImageSize(width, height);
+    validateImageSize(width, height, minPixels);
     return `${width}x${height}`;
 }
 
@@ -87,25 +91,30 @@ function parseImageDimensions(value: string) {
     return { width: Number(match[1]), height: Number(match[2]) };
 }
 
-function validateImageSize(width: number, height: number) {
+function validateImageSize(width: number, height: number, minPixels = IMAGE_MIN_PIXELS) {
     if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) throw new Error("图像尺寸必须是正整数，例如 1024x1024");
     if (width % IMAGE_SIZE_STEP !== 0 || height % IMAGE_SIZE_STEP !== 0) throw new Error("图像尺寸的宽高必须是 16 的倍数，请调整尺寸");
     if (Math.max(width, height) > IMAGE_MAX_EDGE) throw new Error("图像尺寸最长边不能超过 3840px，请调整尺寸");
     if (Math.max(width, height) / Math.min(width, height) > IMAGE_MAX_RATIO) throw new Error("图像宽高比不能超过 3:1，请调整尺寸");
     const pixels = width * height;
-    if (pixels < IMAGE_MIN_PIXELS || pixels > IMAGE_MAX_PIXELS) throw new Error("图像总像素需在 655360 到 8294400 之间，请调整尺寸");
+    if (pixels < minPixels || pixels > IMAGE_MAX_PIXELS) throw new Error(`图像总像素需在 ${minPixels} 到 ${IMAGE_MAX_PIXELS} 之间，请调整尺寸`);
 }
 
-function resolveRequestSize(quality: string | undefined, size: string) {
+function resolveRequestSize(model: string, quality: string | undefined, size: string) {
+    const minPixels = resolveMinPixels(model);
     const value = size.trim();
     if (!value || value.toLowerCase() === "auto") return undefined;
     const dimensions = parseImageDimensions(value);
     if (dimensions) {
-        validateImageSize(dimensions.width, dimensions.height);
+        validateImageSize(dimensions.width, dimensions.height, minPixels);
         return `${dimensions.width}x${dimensions.height}`;
     }
-    if (value.includes(":")) return resolveSize(quality, value);
+    if (value.includes(":")) return resolveSize(quality, value, minPixels);
     throw new Error("图像尺寸格式不支持，请使用 auto、9:16 或 1024x1024");
+}
+
+function resolveMinPixels(model: string) {
+    return IMAGE_MODEL_MIN_PIXELS.find((item) => item.pattern.test(model || ""))?.minPixels || IMAGE_MIN_PIXELS;
 }
 
 function resolveImageDataUrl(item: Record<string, unknown>) {
@@ -120,7 +129,7 @@ function resolveImageDataUrl(item: Record<string, unknown>) {
 
 function parseImagePayload(payload: ImageApiResponse) {
     if (typeof payload.code === "number" && payload.code !== 0) {
-        throw new Error(payload.msg || "请求失败");
+        throw new Error(payload.msg || payload.message || "请求失败");
     }
     const images =
         payload.data
@@ -136,9 +145,9 @@ function parseImagePayload(payload: ImageApiResponse) {
 }
 
 function readAxiosError(error: unknown, fallback: string) {
-    if (axios.isAxiosError<{ error?: { message?: string }; msg?: string; code?: number }>(error)) {
+    if (axios.isAxiosError<{ error?: { message?: string }; msg?: string; message?: string; code?: number }>(error)) {
         const responseData = error.response?.data;
-        return responseData?.msg || responseData?.error?.message || readStatusError(error.response?.status, fallback);
+        return responseData?.msg || responseData?.message || responseData?.error?.message || readStatusError(error.response?.status, fallback);
     }
     return error instanceof Error ? error.message : fallback;
 }
@@ -168,21 +177,22 @@ function withSystemPrompt(config: AiConfig, prompt: string) {
     return systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt;
 }
 
-function aiApiUrl(config: AiConfig, path: string) {
-    return config.channelMode === "remote" ? `/api/v1${path}` : buildApiUrl(config.baseUrl, path);
+function imageApiUrl(config: AiConfig, path: string) {
+    return buildCapabilityApiUrl(config, "image", path);
 }
 
-function aiHeaders(config: AiConfig, contentType?: string) {
+function textApiUrl(config: AiConfig, path: string) {
+    return buildCapabilityApiUrl(config, "text", path);
+}
+
+function imageHeaders(config: AiConfig, contentType?: string) {
     const token = useUserStore.getState().token;
-    return config.channelMode === "remote"
-        ? {
-              ...(token ? { Authorization: `Bearer ${token}` } : {}),
-              ...(contentType ? { "Content-Type": contentType } : {}),
-          }
-        : {
-              Authorization: `Bearer ${config.apiKey}`,
-              ...(contentType ? { "Content-Type": contentType } : {}),
-          };
+    return buildCapabilityHeaders(config, "image", token, contentType);
+}
+
+function textHeaders(config: AiConfig, contentType?: string) {
+    const token = useUserStore.getState().token;
+    return buildCapabilityHeaders(config, "text", token, contentType);
 }
 
 function refreshRemoteUser(config: AiConfig) {
@@ -197,10 +207,10 @@ function withSystemMessage(config: AiConfig, messages: ChatCompletionMessage[]) 
 export async function requestGeneration(config: AiConfig, prompt: string) {
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const quality = normalizeQuality(config.quality);
-    const requestSize = resolveRequestSize(quality, config.size);
+    const requestSize = resolveRequestSize(config.model, quality, config.size);
     try {
         const response = await axios.post<ImageApiResponse>(
-            aiApiUrl(config, "/images/generations"),
+            imageApiUrl(config, "/images/generations"),
             {
                 model: config.model,
                 prompt: withSystemPrompt(config, prompt),
@@ -211,7 +221,7 @@ export async function requestGeneration(config: AiConfig, prompt: string) {
                 output_format: IMAGE_OUTPUT_FORMAT,
             },
             {
-                headers: aiHeaders(config, "application/json"),
+                headers: imageHeaders(config, "application/json"),
             },
         );
         const images = parseImagePayload(response.data);
@@ -225,7 +235,7 @@ export async function requestGeneration(config: AiConfig, prompt: string) {
 export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], mask?: ReferenceImage) {
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const quality = normalizeQuality(config.quality);
-    const requestSize = resolveRequestSize(quality, config.size);
+    const requestSize = resolveRequestSize(config.model, quality, config.size);
     const requestPrompt = buildImageReferencePromptText(prompt, references);
     const formData = new FormData();
     formData.set("model", config.model);
@@ -244,7 +254,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     if (mask) formData.set("mask", dataUrlToFile(mask));
 
     try {
-        const response = await axios.post<ImageApiResponse>(aiApiUrl(config, "/images/edits"), formData, { headers: aiHeaders(config) });
+        const response = await axios.post<ImageApiResponse>(imageApiUrl(config, "/images/edits"), formData, { headers: imageHeaders(config) });
         const images = parseImagePayload(response.data);
         refreshRemoteUser(config);
         return images;
@@ -260,7 +270,7 @@ export async function requestImageQuestion(config: AiConfig, messages: ChatCompl
 
     try {
         const response = await axios.post(
-            aiApiUrl(config, "/chat/completions"),
+            textApiUrl(config, "/chat/completions"),
             {
                 model: config.model,
                 messages: withSystemMessage(config, messages),
@@ -268,7 +278,7 @@ export async function requestImageQuestion(config: AiConfig, messages: ChatCompl
             },
             {
                 headers: {
-                    ...aiHeaders(config, "application/json"),
+                    ...textHeaders(config, "application/json"),
                 } as Record<string, string>,
                 responseType: "text",
                 onDownloadProgress: (event) => {
@@ -315,12 +325,12 @@ export async function requestImageQuestion(config: AiConfig, messages: ChatCompl
     return answer || "没有返回内容";
 }
 
-export async function fetchImageModels(config: AiConfig) {
+export async function fetchImageModels(config: AiConfig, capability: "image" | "video" | "text" | "audio" = "image") {
     if (config.channelMode === "remote") return config.models;
     try {
-        const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string } }>(buildApiUrl(config.baseUrl, "/models"), {
+        const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string } }>(buildCapabilityApiUrl(config, capability, "/models"), {
             headers: {
-                Authorization: `Bearer ${config.apiKey}`,
+                Authorization: `Bearer ${getCapabilityApiKey(config, capability)}`,
             },
         });
         return (response.data.data || [])

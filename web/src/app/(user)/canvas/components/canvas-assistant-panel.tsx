@@ -142,7 +142,7 @@ export function CanvasAssistantPanel({ nodes, selectedNodeIds, sessions, activeS
 
     const sendMessage = async (text: string, nextMode: AssistantMode, history: CanvasAssistantMessage[], savedReferences?: CanvasAssistantReference[]) => {
         const requestConfig = { ...effectiveConfig, count: nextMode === "image" ? effectiveConfig.canvasImageCount || effectiveConfig.count : effectiveConfig.count, model: nextMode === "image" ? effectiveConfig.imageModel || effectiveConfig.model : effectiveConfig.textModel || effectiveConfig.model };
-        if (!isAiConfigReady(requestConfig, requestConfig.model)) {
+        if (!isAiConfigReady(requestConfig, requestConfig.model, nextMode === "image" ? "image" : "text")) {
             openConfigDialog(true);
             return;
         }

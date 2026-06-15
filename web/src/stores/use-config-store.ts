@@ -7,10 +7,18 @@ import { persist } from "zustand/middleware";
 import { apiGet } from "@/services/api/request";
 import type { AdminPublicSettings } from "@/services/api/admin";
 
+export type LocalChannelConfig = {
+    baseUrl: string;
+    apiKey: string;
+};
+
+export type LocalChannelsConfig = Record<ModelCapability, LocalChannelConfig>;
+
 export type AiConfig = {
     channelMode: "remote" | "local";
     baseUrl: string;
     apiKey: string;
+    localChannels: LocalChannelsConfig;
     model: string;
     imageModel: string;
     videoModel: string;
@@ -48,10 +56,23 @@ export type WebdavSyncConfig = {
 export const CONFIG_STORE_KEY = "infinite-canvas:ai_config_store";
 export type ModelCapability = "image" | "video" | "text" | "audio";
 
+export const defaultLocalChannelConfig: LocalChannelConfig = {
+    baseUrl: "https://api.openai.com",
+    apiKey: "",
+};
+
+export const defaultLocalChannelsConfig: LocalChannelsConfig = {
+    image: { ...defaultLocalChannelConfig },
+    video: { ...defaultLocalChannelConfig },
+    text: { ...defaultLocalChannelConfig },
+    audio: { ...defaultLocalChannelConfig },
+};
+
 export const defaultConfig: AiConfig = {
     channelMode: "local",
     baseUrl: "https://api.openai.com",
     apiKey: "",
+    localChannels: defaultLocalChannelsConfig,
     model: "gpt-image-2",
     imageModel: "gpt-image-2",
     videoModel: "grok-imagine-video",
@@ -94,9 +115,10 @@ type ConfigStore = {
     isConfigOpen: boolean;
     shouldPromptContinue: boolean;
     updateConfig: <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
+    updateLocalChannelConfig: (capability: ModelCapability, key: keyof LocalChannelConfig, value: string) => void;
     updateWebdavConfig: <K extends keyof WebdavSyncConfig>(key: K, value: WebdavSyncConfig[K]) => void;
     loadPublicSettings: () => Promise<void>;
-    isAiConfigReady: (config: AiConfig, model: string) => boolean;
+    isAiConfigReady: (config: AiConfig, model: string, capability?: ModelCapability) => boolean;
     openConfigDialog: (shouldPromptContinue?: boolean) => void;
     setConfigDialogOpen: (isOpen: boolean) => void;
     clearPromptContinue: () => void;
@@ -171,6 +193,41 @@ export function filterModelsByCapability(models: string[], capability?: ModelCap
     return capability ? models.filter((model) => modelMatchesCapability(model, capability)) : models;
 }
 
+export function inferCapabilityFromModel(model: string): ModelCapability {
+    if (isImageModelName(model)) return "image";
+    if (isVideoModelName(model)) return "video";
+    if (isAudioModelName(model)) return "audio";
+    return "text";
+}
+
+export function getLocalChannelConfig(config: AiConfig, capability: ModelCapability): LocalChannelConfig {
+    return config.localChannels?.[capability] || { baseUrl: config.baseUrl, apiKey: config.apiKey };
+}
+
+export function getCapabilityBaseUrl(config: AiConfig, capability: ModelCapability) {
+    return getLocalChannelConfig(config, capability).baseUrl;
+}
+
+export function getCapabilityApiKey(config: AiConfig, capability: ModelCapability) {
+    return getLocalChannelConfig(config, capability).apiKey;
+}
+
+export function buildCapabilityApiUrl(config: AiConfig, capability: ModelCapability, path: string) {
+    return config.channelMode === "remote" ? `/api/v1${path}` : buildApiUrl(getCapabilityBaseUrl(config, capability), path);
+}
+
+export function buildCapabilityHeaders(config: AiConfig, capability: ModelCapability, token: string | undefined, contentType?: string) {
+    return config.channelMode === "remote"
+        ? {
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              ...(contentType ? { "Content-Type": contentType } : {}),
+          }
+        : {
+              Authorization: `Bearer ${getCapabilityApiKey(config, capability)}`,
+              ...(contentType ? { "Content-Type": contentType } : {}),
+          };
+}
+
 export function selectableModelsByCapability(config: AiConfig, capability?: ModelCapability) {
     if (!capability) return config.models;
     return config[modelListKey(capability)];
@@ -180,8 +237,11 @@ function modelListKey(capability: ModelCapability) {
     return `${capability}Models` as "imageModels" | "videoModels" | "textModels" | "audioModels";
 }
 
-function isAiConfigReady(config: AiConfig, model: string) {
-    return Boolean(model.trim()) && (config.channelMode === "remote" || Boolean(config.baseUrl.trim() && config.apiKey.trim()));
+function isAiConfigReady(config: AiConfig, model: string, capability?: ModelCapability) {
+    if (!model.trim()) return false;
+    if (config.channelMode === "remote") return true;
+    const target = getLocalChannelConfig(config, capability || inferCapabilityFromModel(model));
+    return Boolean(target.baseUrl.trim() && target.apiKey.trim());
 }
 
 export const useConfigStore = create<ConfigStore>()(
@@ -200,6 +260,19 @@ export const useConfigStore = create<ConfigStore>()(
                         [key]: value,
                     },
                 })),
+            updateLocalChannelConfig: (capability, key, value) =>
+                set((state) => ({
+                    config: {
+                        ...state.config,
+                        localChannels: {
+                            ...state.config.localChannels,
+                            [capability]: {
+                                ...state.config.localChannels[capability],
+                                [key]: value,
+                            },
+                        },
+                    },
+                })),
             updateWebdavConfig: (key, value) =>
                 set((state) => ({
                     webdav: {
@@ -216,7 +289,7 @@ export const useConfigStore = create<ConfigStore>()(
                     set({ isPublicSettingsLoading: false });
                 }
             },
-            isAiConfigReady: (config, model) => isAiConfigReady(config, model),
+            isAiConfigReady: (config, model, capability) => isAiConfigReady(config, model, capability),
             openConfigDialog: (shouldPromptContinue = false) => set({ isConfigOpen: true, shouldPromptContinue }),
             setConfigDialogOpen: (isConfigOpen) => set({ isConfigOpen }),
             clearPromptContinue: () => set({ shouldPromptContinue: false }),
@@ -229,11 +302,21 @@ export const useConfigStore = create<ConfigStore>()(
                 const persistedConfig = (persistedState.config || {}) as Partial<AiConfig>;
                 const persistedWebdav = (persistedState.webdav || {}) as Partial<WebdavSyncConfig>;
                 const config = { ...defaultConfig, ...persistedConfig };
+                const legacyBaseUrl = config.baseUrl || defaultLocalChannelConfig.baseUrl;
+                const legacyApiKey = config.apiKey || defaultLocalChannelConfig.apiKey;
+                const persistedLocalChannels = persistedConfig.localChannels || {};
+                const localChannels = {
+                    image: { ...defaultLocalChannelConfig, baseUrl: legacyBaseUrl, apiKey: legacyApiKey, ...persistedLocalChannels.image },
+                    video: { ...defaultLocalChannelConfig, baseUrl: legacyBaseUrl, apiKey: legacyApiKey, ...persistedLocalChannels.video },
+                    text: { ...defaultLocalChannelConfig, baseUrl: legacyBaseUrl, apiKey: legacyApiKey, ...persistedLocalChannels.text },
+                    audio: { ...defaultLocalChannelConfig, baseUrl: legacyBaseUrl, apiKey: legacyApiKey, ...persistedLocalChannels.audio },
+                };
                 return {
                     ...current,
                     webdav: { ...defaultWebdavSyncConfig, ...persistedWebdav },
                     config: {
                         ...config,
+                        localChannels,
                         channelMode: config.channelMode || "remote",
                         imageModel: config.imageModel || config.model,
                         videoModel: config.videoModel || "grok-imagine-video",

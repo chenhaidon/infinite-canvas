@@ -143,7 +143,7 @@ export default function ImagePage() {
             message.error("请输入生图提示词");
             return;
         }
-        if (!isAiConfigReady(effectiveConfig, model)) {
+        if (!isAiConfigReady(effectiveConfig, model, "image")) {
             message.warning("请先完成配置");
             openConfigDialog(true);
             return;
@@ -274,7 +274,7 @@ export default function ImagePage() {
             message.error("请输入生图提示词");
             return null;
         }
-        if (!isAiConfigReady(effectiveConfig, model)) {
+        if (!isAiConfigReady(effectiveConfig, model, "image")) {
             message.warning("请先完成配置");
             openConfigDialog(true);
             return null;

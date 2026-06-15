@@ -1,6 +1,6 @@
 "use client";
 
-import { App, Button, Form, Input, Modal, Progress, Segmented, Select } from "antd";
+import { App, Button, Form, Input, Modal, Progress, Segmented, Select, Space } from "antd";
 import { Cloud, RefreshCw, Wifi } from "lucide-react";
 import { useState } from "react";
 
@@ -9,7 +9,7 @@ import { fetchImageModels } from "@/services/api/image";
 import { syncAppDataToWebdav, type AppSyncDomainKey, type AppSyncProgressEvent } from "@/services/app-sync";
 import { testWebdavConnection, WEBDAV_MANIFEST_FILE_NAME } from "@/services/webdav-sync";
 import { audioFormatOptions, audioVoiceOptions, normalizeAudioSpeedValue } from "@/lib/audio-generation";
-import { filterModelsByCapability, useConfigStore, useEffectiveConfig, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
+import { filterModelsByCapability, getLocalChannelConfig, useConfigStore, useEffectiveConfig, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
 
 type ModelGroup = {
     capability: ModelCapability;
@@ -18,6 +18,18 @@ type ModelGroup = {
     defaultLabel: string;
     optionsLabel: string;
 };
+
+type LocalChannelGroup = {
+    capability: ModelCapability;
+    label: string;
+};
+
+const localChannelGroups: LocalChannelGroup[] = [
+    { capability: "image", label: "图片" },
+    { capability: "video", label: "视频" },
+    { capability: "text", label: "文本" },
+    { capability: "audio", label: "音频" },
+];
 
 type WebdavDomainProgress = {
     label: string;
@@ -58,10 +70,14 @@ export function AppConfigModal() {
     const [testingWebdav, setTestingWebdav] = useState(false);
     const [syncingWebdav, setSyncingWebdav] = useState(false);
     const [webdavSyncStatus, setWebdavSyncStatus] = useState("");
+    const [sharedBaseUrl, setSharedBaseUrl] = useState("");
+    const [sharedApiKey, setSharedApiKey] = useState("");
+    const [refreshCapability, setRefreshCapability] = useState<ModelCapability>("image");
     const [webdavDomainProgress, setWebdavDomainProgress] = useState(createWebdavDomainProgress);
     const config = useConfigStore((state) => state.config);
     const webdav = useConfigStore((state) => state.webdav);
     const updateConfig = useConfigStore((state) => state.updateConfig);
+    const updateLocalChannelConfig = useConfigStore((state) => state.updateLocalChannelConfig);
     const updateWebdavConfig = useConfigStore((state) => state.updateWebdavConfig);
     const isConfigOpen = useConfigStore((state) => state.isConfigOpen);
     const shouldPromptContinue = useConfigStore((state) => state.shouldPromptContinue);
@@ -78,7 +94,7 @@ export function AppConfigModal() {
 
     const finishConfig = () => {
         setConfigDialogOpen(false);
-        if (effectiveMode === "local" && (!config.baseUrl.trim() || !config.apiKey.trim())) return;
+        if (effectiveMode === "local" && localChannelGroups.some((group) => !getLocalChannelConfig(config, group.capability).baseUrl.trim() || !getLocalChannelConfig(config, group.capability).apiKey.trim())) return;
         if (!modelConfig.imageModel.trim() || !modelConfig.videoModel.trim() || !modelConfig.textModel.trim()) return;
         if (!allowCustomChannel && config.channelMode !== "remote") updateConfig("channelMode", "remote");
         message.success(shouldPromptContinue ? "配置已保存，请继续刚才的请求" : "配置已保存");
@@ -87,13 +103,13 @@ export function AppConfigModal() {
 
     const refreshModels = async () => {
         if (effectiveMode === "remote") return;
-        if (!config.baseUrl.trim() || !config.apiKey.trim()) {
-            message.error("请先填写 Base URL 和 API Key");
+        if (!getLocalChannelConfig(config, refreshCapability).baseUrl.trim() || !getLocalChannelConfig(config, refreshCapability).apiKey.trim()) {
+            message.error("请先填写该类型的 Base URL 和 API Key");
             return;
         }
         setLoadingModels(true);
         try {
-            const models = await fetchImageModels(config);
+            const models = await fetchImageModels(config, refreshCapability);
             const imageModels = filterModelsByCapability(models, "image");
             const videoModels = filterModelsByCapability(models, "video");
             const textModels = filterModelsByCapability(models, "text");
@@ -125,7 +141,22 @@ export function AppConfigModal() {
         if (!next.includes(config[group.modelKey])) updateConfig(group.modelKey, next[0] || "");
     };
 
-    const testWebdav = async () => {
+    const applySharedChannelConfig = () => {
+        const baseUrl = sharedBaseUrl.trim();
+        const apiKey = sharedApiKey.trim();
+        if (!baseUrl || !apiKey) {
+            message.error("请先填写统一 Base URL 和 API Key");
+            return;
+        }
+        for (const group of localChannelGroups) {
+            updateLocalChannelConfig(group.capability, "baseUrl", baseUrl);
+            updateLocalChannelConfig(group.capability, "apiKey", apiKey);
+        }
+        updateConfig("baseUrl", baseUrl);
+        updateConfig("apiKey", apiKey);
+        message.success("已应用到全部类型");
+    };
+
         if (!webdavReady) {
             message.error("请先填写 WebDAV 地址");
             return;
@@ -213,22 +244,56 @@ export function AppConfigModal() {
                     ) : null}
                     {effectiveMode === "local" ? (
                         <>
-                            <div className="grid gap-4 md:grid-cols-2">
-                                <Form.Item label="Base URL" className="mb-4">
-                                    <Input value={config.baseUrl} onChange={(event) => updateConfig("baseUrl", event.target.value)} />
-                                </Form.Item>
-                                <Form.Item label="API Key" className="mb-4">
-                                    <Input.Password value={config.apiKey} onChange={(event) => updateConfig("apiKey", event.target.value)} />
-                                </Form.Item>
-                            </div>
+                            <section className="mb-5 rounded-lg border border-stone-200 p-3 dark:border-stone-800">
+                                <div className="mb-3">
+                                    <div className="text-sm font-semibold">统一配置</div>
+                                    <div className="mt-1 text-xs text-stone-500">当四类模型走同一个平台时，可先填写一套 URL / Key，再一键应用到全部类型。</div>
+                                </div>
+                                <div className="grid gap-4 md:grid-cols-[1fr_1fr_auto] md:items-end">
+                                    <Form.Item label="Base URL" className="mb-0">
+                                        <Input value={sharedBaseUrl} onChange={(event) => setSharedBaseUrl(event.target.value)} placeholder="https://api.openai.com" />
+                                    </Form.Item>
+                                    <Form.Item label="API Key" className="mb-0">
+                                        <Input.Password value={sharedApiKey} onChange={(event) => setSharedApiKey(event.target.value)} />
+                                    </Form.Item>
+                                    <Button onClick={applySharedChannelConfig}>应用到全部</Button>
+                                </div>
+                            </section>
+                            <section className="mb-5 rounded-lg border border-stone-200 p-3 dark:border-stone-800">
+                                <div className="mb-3">
+                                    <div className="text-sm font-semibold">按类型独立配置</div>
+                                    <div className="mt-1 text-xs text-stone-500">图片、视频、文本、音频可分别使用不同平台与不同 API Key。</div>
+                                </div>
+                                <div className="grid gap-4 md:grid-cols-2">
+                                    {localChannelGroups.map((group) => {
+                                        const channel = getLocalChannelConfig(config, group.capability);
+                                        return (
+                                            <div key={group.capability} className="rounded-lg border border-stone-200 p-3 dark:border-stone-800">
+                                                <div className="mb-3 text-sm font-medium">{group.label}</div>
+                                                <Space direction="vertical" className="w-full" size="middle">
+                                                    <Form.Item label="Base URL" className="mb-0">
+                                                        <Input value={channel.baseUrl} onChange={(event) => updateLocalChannelConfig(group.capability, "baseUrl", event.target.value)} />
+                                                    </Form.Item>
+                                                    <Form.Item label="API Key" className="mb-0">
+                                                        <Input.Password value={channel.apiKey} onChange={(event) => updateLocalChannelConfig(group.capability, "apiKey", event.target.value)} />
+                                                    </Form.Item>
+                                                </Space>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </section>
                             <div className="mb-5 flex items-center justify-between gap-3 rounded-lg border border-stone-200 px-3 py-2 dark:border-stone-800">
                                 <div className="min-w-0">
                                     <div className="text-sm font-medium">模型列表</div>
                                     <div className="mt-1 text-xs text-stone-500">当前已保存 {config.models.length} 个模型</div>
                                 </div>
-                                <Button size="small" loading={loadingModels} onClick={() => void refreshModels()}>
-                                    拉取模型列表
-                                </Button>
+                                <div className="flex items-center gap-2">
+                                    <Select size="small" value={refreshCapability} options={localChannelGroups.map((group) => ({ label: group.label, value: group.capability }))} onChange={(value) => setRefreshCapability(value)} style={{ width: 108 }} />
+                                    <Button size="small" loading={loadingModels} onClick={() => void refreshModels()}>
+                                        拉取模型列表
+                                    </Button>
+                                </div>
                             </div>
                         </>
                     ) : (
