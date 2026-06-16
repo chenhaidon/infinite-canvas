@@ -157,6 +157,7 @@ export function AppConfigModal() {
         message.success("已应用到全部类型");
     };
 
+    const testWebdav = async () => {
         if (!webdavReady) {
             message.error("请先填写 WebDAV 地址");
             return;
